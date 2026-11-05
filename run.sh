@@ -44,7 +44,10 @@ game=$("$PYTHON" scripts/mods.py "$game" --out "$out" \
     --mods-dir "${BB_MODS_DIR:-$data/mods}" --config "${BB_MODS_CONFIG:-$data/mods.json}" \
     --enabled "${BB_MODS_ENABLED:-1}")
 # A private merged view lasts for this launch, including restarts. Cleanup only our own view.
-if [[ $game != "$(realpath "$original_game")" ]]; then
+# Compared as folders, not as text: on Windows mods.py prints the game folder as F:\..., which
+# never equalled bash's /f/... - the game folder itself was then removed at exit.
+if ! "$PYTHON" -c 'import os,sys; sys.exit(0 if os.path.samefile(sys.argv[1], sys.argv[2]) else 1)' \
+        "$game" "$original_game"; then
     mod_game=$game
     trap '"$PYTHON" -c '\''import shutil,sys; shutil.rmtree(sys.argv[1])'\'' "$mod_game"' EXIT
 fi
@@ -73,7 +76,8 @@ fps=${BB_FPS:-uncap}
 # (output and presets change in the menu without a restart, but post-processing stays at 1080p
 # and scene targets are copied back: much slower on the Steam Deck and older GPUs). Chosen by
 # BB_LIVE_RES=0/1, else bbport.ini live_resolution=0/1/auto (auto: the GPU check, strong
-# discrete GPUs get them); off when unset. 1080p output and TAA always use the live path.
+# discrete GPUs get them, except above 1080p with depth of field on); off when unset. 1080p
+# output and TAA always use the live path.
 if [[ -z ${BB_RENDER_RES:-} ]]; then
     read -r scaled_render scaled_output < <("$PYTHON" scripts/patches.py --print-scaled --settings "$BB_CONFIG") || true
 fi
@@ -81,10 +85,20 @@ live=0
 if [[ -n ${scaled_output:-} ]]; then
     live=${BB_LIVE_RES:-}
     # Bash builtins only: the AppImage's PATH has no sed/grep (a missing one ended run.sh silently).
+    dof=1
     if [[ -z $live && -f $BB_CONFIG ]]; then
         while IFS= read -r line || [[ -n $line ]]; do
             [[ $line =~ ^live_resolution=([01]|auto)$ ]] && live=${BASH_REMATCH[1]}
+            [[ $line =~ ^effect_dof=([01])$ ]] && dof=${BASH_REMATCH[1]}
         done < "$BB_CONFIG"
+    fi
+    # auto keeps the startup patch above 1080p with depth of field on: in the live path the
+    # game's depth of field composite blurs scenes larger than its 1920x1080 (run.py
+    # auto_live_blurs_dof).
+    if [[ $live == auto && $dof == 1 && $scaled_output =~ ^([0-9]+)x([0-9]+)$ ]] &&
+       (( BASH_REMATCH[1] > 1920 || BASH_REMATCH[2] > 1080 )); then
+        live=0
+        echo "Output ${scaled_output}: live resolution auto: startup patch (depth of field blurs live scenes above 1080p; live_resolution=1 forces live changes)"
     fi
     if [[ $live == auto ]]; then
         if [[ -n ${BB_PROBE:-} ]]; then caps=$(dirname -- "$BB_PROBE")/bb-gpu-capabilities
