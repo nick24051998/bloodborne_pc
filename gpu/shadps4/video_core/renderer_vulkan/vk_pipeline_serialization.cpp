@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -9,14 +16,24 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/shader_build.h"
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-// bbport: past both histories (port 7/7/5, upstream 0.20.1 9/6/3): caches of either are rebuilt.
-// 11: the push data block covers all 56 buffer offsets (shaders of 10 read some out of bounds).
-static constexpr u32 ShaderBinaryVersion = 11u;
-static constexpr u32 ShaderMetaVersion = 8u;
-static constexpr u32 PipelineKeyVersion = 6u;
+// bbport: above every version a release has used (1.9.2: 11, 8, 6), never back to an old one: the
+// GPU rollback to 1.8.2's code took them back to 7, 7, 5, and a cache another build wrote into
+// the same folder then passed as this build's.
+// Projection jitter needs recompiled vertex shaders, including for existing caches.
+static constexpr u32 ShaderBinaryVersion = 13u;
+static constexpr u32 ShaderMetaVersion = 9u;
+static constexpr u32 PipelineKeyVersion = 7u;
+
+// bbport: shader binaries carry no version of their own, so their names do: a build with another
+// version writes its binaries beside these instead of over them (where a shader's metadata
+// passed its version check and then loaded the other build's binary).
+static std::string ShaderBinaryName(u64 pgm_hash, size_t perm_idx) {
+    return fmt::format("{:#018x}_{}_v{}", pgm_hash, perm_idx, ShaderBinaryVersion);
+}
 } // namespace Serialization
 
 namespace Vulkan {
@@ -89,11 +106,12 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
     }
 
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
+                                       Serialization::ShaderBinaryName(pgm_hash, perm_idx),
                                        std::move(spv));
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
     Serialization::Reader meta{ar};
 
@@ -121,6 +139,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     if (info.hw_stage == Shader::HwStage::Vertex && spec.runtime_info.hw.vs.motion_vectors) {
         return false;
     }
+
+    fetch_shader_data = spec.fetch_shader_data;
     return true;
 }
 
@@ -145,6 +165,20 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
     return true;
 }
 
+struct PipelineCache::PreloadJob {
+    bool compute{};
+    ComputePipelineKey compute_key{};
+    GraphicsPipelineKey graphics_key{};
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    GraphicsPipeline::SerializationSupport graphics_sdata{};
+    ComputePipeline::SerializationSupport compute_sdata{};
+    std::unique_ptr<GraphicsPipeline> graphics;
+    std::unique_ptr<ComputePipeline> compute_pipeline;
+};
+
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     compute_key.Deserialize(ar);
 
@@ -166,6 +200,17 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
+
+    if (preload_jobs) {
+        auto& job = preload_jobs->emplace_back();
+        job.compute = true;
+        job.compute_key = compute_key;
+        job.infos = sel.infos;
+        job.modules = sel.modules;
+        sel.infos.fill(nullptr);
+        sel.modules.fill(nullptr);
+        return true;
+    }
 
     it.value() =
         std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
@@ -220,6 +265,13 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // bbport: a pipeline that failed to load (a stale stage) returned with the stages it had
+    // already loaded still selected, and the next one kept them for the stages it does not have:
+    // a shadow pipeline (no fragment shader) was built with another pipeline's fragment shader,
+    // and cast striped shadows (Chalice Dungeons, NVIDIA, a cache with stale entries).
+    sel.infos.fill(nullptr);
+    sel.modules.fill(nullptr);
+    sel.fetch_shader.reset();
     sel.graphics_key.Deserialize(ar);
 
     // bbport: motion-vector pipelines are never preloaded. Their vertex shader embeds session-
@@ -259,10 +311,23 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(sel.graphics_key);
     ASSERT(is_new);
 
+    if (preload_jobs) {
+        auto& job = preload_jobs->emplace_back();
+        job.graphics_key = sel.graphics_key;
+        job.infos = sel.infos;
+        job.runtime_infos = sel.runtime_infos;
+        job.modules = sel.modules;
+        job.fetch_shader = sel.fetch_shader;
+        job.graphics_sdata = sdata;
+        sel.infos.fill(nullptr);
+        sel.modules.fill(nullptr);
+        sel.fetch_shader.reset();
+        return true;
+    }
+
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-        sel.runtime_infos, sel.fetch_shader ? &*sel.fetch_shader : nullptr, sel.modules, sdata,
-        true);
+        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
 
     sel.infos.fill(nullptr);
     sel.modules.fill(nullptr);
@@ -281,13 +346,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, sel.fetch_shader, spec, perm_idx)) {
         return false;
     }
 
     std::vector<u32> spv{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
+                                       Serialization::ShaderBinaryName(program->info.pgm_hash, perm_idx),
                                        spv);
     if (spv.empty()) {
         return false;
@@ -325,10 +390,6 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     sel.infos[stage] = &it_pgm.value()->info;
     sel.modules[stage] = module;
-    if (const auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data;
-        !fetch.Empty()) {
-        sel.fetch_shader = fetch;
-    }
 
     return true;
 }
@@ -340,16 +401,29 @@ void PipelineCache::WarmUp() {
 
     Storage::DataBase::Instance().Open();
 
+    // bbport: the cache holds what one build's recompiler made, and the versions above were not
+    // raised with every change to it. Testers whose beta shared a cache folder with another
+    // build got that build's shaders: dark pictures and hundreds of "stale pipelines" in their
+    // logs, gone once the cache was cleared. The shader build, a fingerprint of the sources that
+    // decide the cache (gpu/CMakeLists.txt), marks the build that wrote it; another build's
+    // cache is rebuilt, never loaded.
+    const std::string_view build{BB_SHADER_BUILD};
+    const auto start_cache = [&] {
+        Storage::DataBase::Instance().FinishPreload();
+        std::vector<u8> profile_data(sizeof(profile));
+        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(profile_data));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "build",
+                                           std::vector<u8>(build.begin(), build.end()));
+    };
+
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
     if (profile_data.empty()) {
-        Storage::DataBase::Instance().FinishPreload();
-
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
+        std::printf("Pipeline cache: new, for shader build %s\n", BB_SHADER_BUILD);
+        start_cache();
         return;
     }
     if (profile_data.size() != sizeof(Shader::Profile)) {
@@ -366,17 +440,31 @@ void PipelineCache::WarmUp() {
         // Start a fresh cache for this build and GPU instead.
         LOG_WARNING(Render, "Pipeline cache isn't compatible with current system: rebuilding it");
         Storage::DataBase::Instance().Clear();
-        Storage::DataBase::Instance().FinishPreload();
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
-        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
+        start_cache();
+        return;
+    }
+    std::vector<u8> build_data{};
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "build", build_data);
+    const std::string cached_build(build_data.begin(), build_data.end());
+    if (cached_build != build) {
+        LOG_WARNING(Render,
+                    "Pipeline cache was written by another build ({}): rebuilding it for this one "
+                    "(shader build {})",
+                    cached_build.empty() ? "one without a shader build" : cached_build.substr(0, 32),
+                    build);
+        Storage::DataBase::Instance().Clear();
+        start_cache();
         return;
     }
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
 
+    // bbport: the stages are read here, one after the other; the pipelines are then built on
+    // all CPU cores (BuildPreloaded), where the driver spends nearly all of the preload's time.
+    const auto preload_start = std::chrono::steady_clock::now();
+    std::vector<PreloadJob> jobs;
+    preload_jobs = &jobs;
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
@@ -405,13 +493,80 @@ void PipelineCache::WarmUp() {
             }
         });
 
+    preload_jobs = nullptr;
+    num_pipelines -= BuildPreloaded(jobs);
+    driver_cache_changes += num_pipelines;
+    std::printf("Pipeline cache: preload took %.1f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_start)
+                    .count());
+
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    std::printf("Pipeline cache: %u of %u pipelines preloaded (shader build %s)\n", num_pipelines,
+                num_total_pipelines, BB_SHADER_BUILD);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
     }
 
     Storage::DataBase::Instance().FinishPreload();
+}
+
+// The pipelines only use the device while they are built for the preload (no guest memory, no
+// command buffers), and the driver's pipeline cache is synchronized by the driver.
+u32 PipelineCache::BuildPreloaded(std::vector<PreloadJob>& jobs) {
+    if (jobs.empty()) {
+        return 0;
+    }
+    // One core is left to the rest of the start; BB_PRELOAD_THREADS=1 builds them one by one.
+    u32 threads = std::clamp(std::thread::hardware_concurrency(), 2u, 17u) - 1;
+    if (const char* env = std::getenv("BB_PRELOAD_THREADS"); env && *env) {
+        threads = std::clamp<u32>(u32(std::strtoul(env, nullptr, 10)), 1u, 64u);
+    }
+    threads = std::min<u32>(threads, u32(jobs.size()));
+
+    std::atomic<size_t> next{0};
+    const auto build = [&] {
+        for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < jobs.size();) {
+            auto& job = jobs[i];
+            if (job.compute) {
+                job.compute_pipeline = std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile, *pipeline_cache, job.compute_key,
+                    *job.infos[0], job.modules[0], job.compute_sdata, true);
+            } else {
+                job.graphics = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, job.graphics_key, *pipeline_cache,
+                    job.infos, job.runtime_infos, job.fetch_shader, job.modules,
+                    job.graphics_sdata, true);
+            }
+        }
+    };
+    {
+        std::vector<std::jthread> pool;
+        for (u32 t = 1; t < threads; ++t) {
+            pool.emplace_back(build);
+        }
+        build();
+    }
+
+    // As before: a pipeline the driver could not build is left to compile at first use.
+    u32 failed = 0;
+    for (auto& job : jobs) {
+        if (job.compute) {
+            if (job.compute_pipeline && job.compute_pipeline->IsValid()) {
+                compute_pipelines[job.compute_key] = std::move(job.compute_pipeline);
+            } else {
+                compute_pipelines.erase(job.compute_key);
+                ++failed;
+            }
+        } else if (job.graphics && job.graphics->IsValid()) {
+            graphics_pipelines[job.graphics_key] = std::move(job.graphics);
+        } else {
+            graphics_pipelines.erase(job.graphics_key);
+            ++failed;
+        }
+    }
+    std::printf("Pipeline cache: %zu pipelines built on %u threads\n", jobs.size(), threads);
+    return failed;
 }
 
 void PipelineCache::Sync() {
@@ -490,9 +645,9 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
 
     spec.Write(bitset.to_string());
 
-    if (!fetch_shader_data.Empty()) {
-        spec.Write(sizeof(fetch_shader_data));
-        fetch_shader_data.Serialize(ar);
+    if (fetch_shader_data) {
+        spec.Write(sizeof(*fetch_shader_data));
+        fetch_shader_data->Serialize(ar);
     } else {
         spec.Write(size_t{0});
     }

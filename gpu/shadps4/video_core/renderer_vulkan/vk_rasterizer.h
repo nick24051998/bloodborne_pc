@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -37,10 +39,6 @@ public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
-
-    [[nodiscard]] Scheduler& GetScheduler() noexcept {
-        return scheduler;
-    }
 
     [[nodiscard]] Runtime& GetRuntime() noexcept {
         return runtime;
@@ -139,6 +137,7 @@ public:
     /// A guest write hit a protected page.
     bool OnWriteFault(VAddr addr, bool assume_locks);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
@@ -146,9 +145,10 @@ public:
 
     u64 Flush();
     void Finish();
+    /// bbport: BB_EARLY_SUBMIT=1: the frame's work goes to the GPU in parts while it is
+    /// recorded, so the GPU starts drawing before the frame is complete (less latency).
+    void MaybeSubmitEarly();
     void OnSubmit();
-    /// A guest-visible fence or CPU write: pending image downloads land first.
-    void OnFence();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -172,6 +172,10 @@ private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+    /// target_scale for the current draw of a pass into the upscaler's output-size images (ui_pass):
+    /// with Sharp UI recomputed for every draw, also those the render state memo continues the pass
+    /// with, since the game's UI pass sets a viewport per picture.
+    void UpdateUiTransform();
     /// bbport: a draw continuing the open render pass with the same inputs gets the same render
     /// state (RenderStateMemo); nothing can have broken the pass in between (barriers, copies and
     /// dispatches end it).
@@ -302,12 +306,12 @@ private:
     bool SkipOutputlessDraw(const GraphicsPipeline* pipeline);
     void BindVertexBuffers(const GraphicsPipeline* pipeline,
                            const PreparedDraw* prepared = nullptr);
-    void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
+    void BindIndexBuffer(u32 index_offset = 0);
     /// bbport: BindVertexBuffers/BindIndexBuffer in two halves: obtaining the buffers
     /// (vertex_binds, index_bind) and recording the binds.
     void ResolveVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared);
     void EmitVertexBuffers();
-    void ResolveIndexBuffer(u32 index_offset, bool is_indirect = false);
+    void ResolveIndexBuffer(u32 index_offset);
     void EmitIndexBuffer();
 
     void ResetBindings(bool is_compute);
@@ -341,6 +345,12 @@ private:
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
+    struct UiPass {
+        bool active = false;    ///< the current pass is redirected into the output-size images
+        bool native_ui = false; ///< the upscaler's redirect draws the native UI
+        std::pair<u32, u32> guest{1, 1};
+        std::pair<u32, u32> output{1, 1};
+    } ui_pass; ///< what UpdateUiTransform scales from
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
 
@@ -354,10 +364,9 @@ private:
         const VideoCore::Buffer* buffer;
         u64 offset;
         u32 size;
-        vk::AccessFlags2 src_access;
+        bool is_written;
     };
-    /// Shader, vertex, index and indirect buffers of the current draw (barrier tracking).
-    std::vector<BoundBuffer> bound_buffers;
+    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
@@ -439,7 +448,6 @@ private:
     struct IndexBind {
         vk::Buffer handle;
         u64 offset;
-        vk::DeviceSize size;
         vk::IndexType type;
     } index_bind{};
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
@@ -470,6 +478,7 @@ private:
     u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
     /// The memoized cache entry of each image binding (FindImage memo taken), else null.
     boost::container::static_vector<ImageDescCacheEntry*, Shader::NUM_IMAGES> image_binding_entries;
+    bool fault_process_pending{};
     bool attachment_feedback_loop{};
     bool needs_barrier{};
     // bbport: two-stage draw pipeline (stage B state; the thread is the last member so it
@@ -524,6 +533,8 @@ private:
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
+    u32 draws_since_submit = 0;
+    std::chrono::steady_clock::time_point last_submit{};
 };
 
 } // namespace Vulkan

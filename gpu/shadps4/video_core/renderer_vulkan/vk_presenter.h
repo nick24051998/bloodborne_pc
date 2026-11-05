@@ -52,6 +52,8 @@ struct Frame {
     };
     std::array<Generated, FrameGenerator::MaxGenerated> generated{};
     u32 generated_count{};
+    bool detached_output{};
+    u64 latency_id{}; ///< bbport: the submitted game frame shown (LowLatency), 0 for others
 };
 
 enum SchedulerType {
@@ -132,6 +134,7 @@ private:
     /// presents it. `last`: the game frame itself, which also signals the frame's fence.
     /// False when the swapchain could not give an image.
     bool PresentImage(Frame* frame, vk::Image image, bool last);
+    u64 present_latency_id{}; ///< bbport: the game frame's id for its last image (LowLatency)
 
     void SetExpectedGameSize(s32 width, s32 height);
 
@@ -168,6 +171,8 @@ private:
     std::unique_ptr<FrameGenerator> frame_generator;
     /// The game's picture before its UI, through the same passes as the frame.
     Frame hudless_frame{};
+    // One per presentation frame: the completion queue may still sample the older HUD.
+    std::vector<Frame> overlap_hudless_frames;
     std::chrono::steady_clock::time_point last_game_present{};
     std::atomic<double> game_frame_ms{16.7}; ///< written by the present thread
     /// Generated frames per game frame the display can show (UpdateFrameGenLimit).
