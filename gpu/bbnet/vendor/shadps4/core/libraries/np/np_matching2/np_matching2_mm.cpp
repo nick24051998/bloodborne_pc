@@ -485,6 +485,7 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
 
     auto payload_owner = std::make_shared<CallbackPayload>();
     CallbackPayload& p = *payload_owner;
+    s32 left_transport = 0; // bbport: a leaving member's connection, closed after the event
 
     {
         auto cache = NpHandler::GetInstance().LockMatching2Cache(ctx->ctx_id);
@@ -536,6 +537,9 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
             QueueMatching2SignalingEvent(*ctx, room_id, member_id,
                                          ORBIS_NP_MATCHING2_SIGNALING_EVENT_DEAD,
                                          ORBIS_NP_MATCHING2_SIGNALING_ERROR_TERMINATED_BY_PEER);
+            if (const auto peer_it = cache->peers.find(member_id); peer_it != cache->peers.end()) {
+                left_transport = peer_it->second.conn_id;
+            }
             room_it->second.members.erase(mem_it);
             cache->peers.erase(member_id);
             break;
@@ -735,6 +739,11 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
     if (event == ORBIS_NP_MATCHING2_ROOM_EVENT_MEMBER_JOINED) {
         SignalingHandler::StartMatching2(*ctx);
     }
+    if (left_transport != 0) {
+        LOG_INFO(Lib_NpMatching2, "room {}: member {} left, its connection {} closed", room_id,
+                 member_id, left_transport);
+        SignalingHandler::StopMatching2Peer(left_transport);
+    }
 }
 
 void HandleRoomMessage(const ShadNet::NotifyRoomMessage& n) {
@@ -824,6 +833,12 @@ void OnMatchingReply(ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType er
     DispatchRequestComplete(pr, error, body);
 }
 
+// The address of this PC on the network it reaches shadNet through.
+static u32 MmLocalAddr() {
+    std::lock_guard lock(g_mm.mutex);
+    return g_mm.client ? g_mm.client->GetAddrLocal() : 0;
+}
+
 void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
                         std::string_view server_host, u16 tcp_port) {
     u32 server_addr = 0;
@@ -851,6 +866,7 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
         NpSignaling::Transport::SetPeerResolver(nullptr);
         NpSignaling::Transport::SetMatching2Enabled(false);
         NpSignaling::Transport::SetMmServerEndpoint(0, 0);
+        Net::SetP2PRelayServer(0, 0);
         StopMatching2SignalingRuntime();
         return;
     }
@@ -864,15 +880,21 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
         .configured_port = Net::GetP2PAdvertisedPort, // the bound port once running
         .advertised_addr = Net::GetP2PAdvertisedAddr,
         .ensure_transport = Net::EnsureP2PTransport,
+        .local_addr = MmLocalAddr,
     });
     NpSignaling::Transport::SetPeerResolver(matching2_enabled ? RequestSignalingInfos : nullptr);
     NpSignaling::Transport::SetMatching2Enabled(matching2_enabled);
     NpSignaling::Transport::SetMmServerEndpoint(server_addr, server_udp_port);
+    Net::SetP2PRelayServer(server_addr, server_udp_port);
     if (!matching2_enabled) {
         StopMatching2SignalingRuntime();
     }
     client->onRoomEvent = [](const ShadNet::NotifyRoomEvent& n) { HandleRoomEvent(n); };
     client->onRoomMessage = [](const ShadNet::NotifyRoomMessage& n) { HandleRoomMessage(n); };
+    client->onSignalingHelper = [](const ShadNet::NotifySignalingHelper& n) {
+        SignalingHandler::HandlePeerConnectRequest(n.npid, IpStringToAddr(n.ip),
+                                                   Libraries::Net::sceNetHtons(n.port));
+    };
 }
 
 void ClearMmShadNetClient() {
@@ -888,6 +910,7 @@ void ClearMmShadNetClient() {
     if (old_client) {
         old_client->onRoomEvent = nullptr;
         old_client->onRoomMessage = nullptr;
+        old_client->onSignalingHelper = nullptr;
     }
     NpSignaling::Transport::SetTransportHooks({});
     NpSignaling::Transport::SetPeerResolver(nullptr);
